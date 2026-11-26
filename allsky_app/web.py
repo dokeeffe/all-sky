@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
+from PIL import Image
+
+from .camera import fits_to_uint8
 from .settings import Settings, SettingsStore
 from .star_store import StarStore
 from .worker import CaptureWorker
@@ -26,11 +30,33 @@ class Dashboard:
         self.worker = worker
 
     def latest_image(self) -> Path | None:
-        image_dir = Path(self.settings.load().image_dir).expanduser()
+        settings = self.settings.load()
+        if not settings.save_fits and not settings.save_jpg:
+            return None
+        image_dir = Path(settings.image_dir).expanduser()
         if not image_dir.is_dir():
             return None
-        images = list(image_dir.glob("allsky-*.jpg"))
-        return max(images, key=lambda path: path.stat().st_mtime) if images else None
+        suffixes = []
+        if settings.save_jpg:
+            suffixes.append(".jpg")
+        if settings.save_fits:
+            suffixes.append(".fits")
+        candidates = [
+            path
+            for suffix in suffixes
+            for path in image_dir.glob(f"allsky-*{suffix}")
+        ]
+        latest: Path | None = None
+        latest_mtime = -1
+        for path in candidates:
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest = path
+                latest_mtime = mtime
+        return latest
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -38,18 +64,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
     dashboard: Dashboard
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        path = urlsplit(self.path).path
+        if path == "/":
             self._send_html(self._render_page())
-        elif self.path == "/latest.jpg":
+        elif path == "/latest.jpg":
             image = self.dashboard.latest_image()
             if image is None:
                 self.send_error(404, "No captured image is available")
                 return
             try:
-                content = image.read_bytes()
+                image_data = image.read_bytes()
+                if image.suffix.lower() == ".fits":
+                    preview = Image.fromarray(fits_to_uint8(image_data))
+                    buffer = io.BytesIO()
+                    preview.save(buffer, format="JPEG", quality=92)
+                    content = buffer.getvalue()
+                else:
+                    content = image_data
             except OSError:
                 logger.exception("Could not read latest image %s", image)
                 self.send_error(500, "Could not read latest image")
+                return
+            except (ValueError, KeyError) as exc:
+                logger.exception("Could not preview FITS image %s", image)
+                self.send_error(500, f"Could not preview FITS image: {exc}")
                 return
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -57,9 +95,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(content)
-        elif self.path == "/api/status":
-            self._send_json({"worker": self.dashboard.worker.status(),
-                             "recent_stars": self.dashboard.stars.recent(20)})
+        elif path == "/api/status":
+            latest = self.dashboard.latest_image()
+            try:
+                latest_version = latest.stat().st_mtime_ns if latest else None
+            except OSError:
+                latest = None
+                latest_version = None
+            self._send_json({
+                "worker": self.dashboard.worker.status(),
+                "latest_star": self.dashboard.stars.latest(),
+                "star_series": self.dashboard.stars.since(6),
+                "latest_image": latest.name if latest else None,
+                "latest_image_path": str(latest) if latest else None,
+                "latest_version": latest_version,
+            })
         else:
             self.send_error(404)
 
@@ -87,6 +137,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "auto_gain": "auto_gain" in form,
                 "manual_gain": self._form_value(form, "manual_gain"),
                 "indi_port": self._form_value(form, "indi_port"),
+                "save_fits": "save_fits" in form,
+                "save_jpg": "save_jpg" in form,
+                "max_image_dir_gb": self._form_value(form, "max_image_dir_gb"),
             })
             self.dashboard.settings.save(settings)
         except (UnicodeDecodeError, ValueError, OSError) as exc:
@@ -111,20 +164,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         status = self.dashboard.worker.status()
         latest = self.dashboard.latest_image()
         checked = "checked" if settings.auto_gain else ""
+        latest_star = self.dashboard.stars.latest()
+        try:
+            latest_version = latest.stat().st_mtime_ns if latest else ""
+        except OSError:
+            latest = None
+            latest_version = ""
+        latest_key = f"{latest.name}:{latest_version}" if latest else ""
         image_html = (
-            '<img class="latest" src="/latest.jpg" alt="Latest all-sky image">'
+            f'<img id="latest-image" class="latest" data-version="{html.escape(latest_key, quote=True)}" '
+            f'src="/latest.jpg?v={latest_version}" alt="Latest all-sky image">'
             if latest else '<p class="empty">No image captured yet.</p>'
         )
         error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
-        rows = "".join(
-            "<tr><td>{}</td><td>{}</td></tr>".format(
-                html.escape(str(row["captured_at"])),
-                html.escape(str(row["star_count"])),
-            )
-            for row in self.dashboard.stars.recent(20)
+        star_count = str(latest_star["star_count"]) if latest_star else "—"
+        star_time = (
+            html.escape(str(latest_star["captured_at"]))
+            if latest_star else "Waiting for first capture"
         )
-        if not rows:
-            rows = '<tr><td colspan="2">No measurements yet.</td></tr>'
         status_text = html.escape(str(status["phase"]))
         safety_text = "not configured" if status["safety_open"] is None else (
             "open" if status["safety_open"] else "closed / blocked"
@@ -139,14 +196,32 @@ h1,h2{{margin-bottom:.5rem}} section{{background:white;padding:1.2rem;margin:1re
 label{{display:block;margin:.75rem 0 .25rem}} input{{box-sizing:border-box;max-width:100%;padding:.45rem;width:30rem}}
 input[type=checkbox]{{width:auto}}button{{margin-top:1rem;padding:.65rem 1rem;background:#174f78;color:white;border:0;border-radius:4px}}
 .latest{{width:100%;height:auto}}.error{{color:#a00}}.empty{{padding:3rem;text-align:center;background:#111;color:#ddd}}
-table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;border-bottom:1px solid #ddd;text-align:left}}
 .muted{{color:#52616d}}
+.live-grid{{display:grid;grid-template-columns:minmax(0,3fr) minmax(190px,1fr);gap:1rem;align-items:start}}
+.star-card{{background:#f4f7fa;padding:1rem;border-radius:8px;text-align:center}}
+.star-count{{font-size:clamp(2.5rem,7vw,5rem);font-weight:700;line-height:1.1;color:#174f78}}
+.chart{{width:100%;height:auto;min-height:180px}}.chart text{{font:12px system-ui,sans-serif;fill:#52616d}}
+details{{background:white;padding:1rem 1.2rem;margin:1rem 0;border-radius:8px;box-shadow:0 1px 5px #ccd3da}}
+summary{{cursor:pointer;font-size:1.2rem;font-weight:600}}details form{{padding-top:.75rem}}
+@media(max-width:680px){{.live-grid{{grid-template-columns:1fr}}.star-card{{text-align:left}}}}
 </style></head><body>
 <h1>All-sky camera</h1>
 <p class="muted">Capture service: <strong>{status_text}</strong> · Roof safety: <strong>{html.escape(safety_text)}</strong></p>
 {error_html}
-<section><h2>Latest image</h2>{image_html}<p class="muted">{html.escape(str(latest) if latest else '')}</p></section>
-<section><h2>Settings</h2>
+<section><h2>Live sky</h2><div class="live-grid">
+<div><div id="image-container">{image_html}</div>
+<p id="latest-path" class="muted">{html.escape(str(latest) if latest else '')}</p></div>
+<div class="star-card"><h3>Latest star count</h3>
+<div id="latest-star-count" class="star-count">{html.escape(star_count)}</div>
+<p class="muted">Updated <time id="latest-star-time">{star_time}</time></p>
+<p class="muted">Approximate detections</p></div></div>
+<p class="muted">Image and star count update automatically when captures are saved.</p></section>
+<section><h2>Star counts · last 6 hours</h2>
+<svg id="star-chart" class="chart" viewBox="0 0 800 280" role="img"
+aria-label="Star count time series for the last six hours"></svg>
+<p id="chart-empty" class="muted">Waiting for star-count measurements.</p>
+<p class="muted">Approximate local-maximum detections; useful for following sky conditions.</p></section>
+<details><summary>Camera settings</summary>
 <form method="post" action="/settings">
 <label for="image_dir">Image directory</label><input id="image_dir" name="image_dir" required value="{html.escape(settings.image_dir, quote=True)}">
 <label for="indi_driver">INDI driver</label><input id="indi_driver" name="indi_driver" required value="{html.escape(settings.indi_driver, quote=True)}">
@@ -156,11 +231,112 @@ table{{border-collapse:collapse;width:100%}}td,th{{padding:.5rem;border-bottom:1
 <label for="delay_seconds">Delay between exposures (seconds)</label><input id="delay_seconds" name="delay_seconds" type="number" min="0" max="3600" step="0.1" required value="{settings.delay_seconds:g}">
 <label><input type="checkbox" name="auto_gain" value="yes" {checked}> Leave automatic/default gain enabled</label>
 <label for="manual_gain">Manual gain (required when auto gain is disabled)</label><input id="manual_gain" name="manual_gain" type="number" min="0" step="any" value="{'' if settings.manual_gain is None else settings.manual_gain}">
+<fieldset><legend>Save image formats</legend>
+<label><input type="checkbox" name="save_fits" value="yes" {"checked" if settings.save_fits else ""}> Save original FITS</label>
+<label><input type="checkbox" name="save_jpg" value="yes" {"checked" if settings.save_jpg else ""}> Save stretched JPEG preview</label>
+<p class="muted">Star counts are calculated from the downloaded FITS frame even if FITS is not saved.</p>
+</fieldset>
+<label for="max_image_dir_gb">Maximum camera image storage (GB)</label>
+<input id="max_image_dir_gb" name="max_image_dir_gb" type="number" min="0.1" max="100000" step="0.1" required value="{settings.max_image_dir_gb:g}">
+<p class="muted">Checked every 5 minutes. When exceeded, oldest all-sky FITS/JPEG image sets are removed in batches of about 200 MiB.</p>
 <label for="safety_script">Optional roof safety script (exit 0=open, 1=closed)</label><input id="safety_script" name="safety_script" value="{html.escape(settings.safety_script, quote=True)}">
 <label for="safety_check_minutes">Safety check/cache interval (minutes)</label><input id="safety_check_minutes" name="safety_check_minutes" type="number" min="0.1" max="1440" step="0.1" required value="{settings.safety_check_minutes:g}">
-<button type="submit">Save settings</button></form></section>
-<section><h2>Star-count history</h2><table><thead><tr><th>Captured at (UTC)</th><th>Detected stars</th></tr></thead><tbody>{rows}</tbody></table>
-<p class="muted">Counts are approximate local-maximum detections, useful for tracking sky conditions.</p></section>
+<button type="submit">Save settings</button></form></details>
+<script>
+(() => {{
+  const container = document.getElementById("image-container");
+  const pathLabel = document.getElementById("latest-path");
+  const countLabel = document.getElementById("latest-star-count");
+  const timeLabel = document.getElementById("latest-star-time");
+  const chart = document.getElementById("star-chart");
+  const chartEmpty = document.getElementById("chart-empty");
+  const svgNamespace = "http://www.w3.org/2000/svg";
+
+  function drawChart(points) {{
+    chart.replaceChildren();
+    if (!points.length) {{
+      chartEmpty.hidden = false;
+      return;
+    }}
+    chartEmpty.hidden = true;
+    const width = 800, height = 280;
+    const left = 58, right = 18, top = 20, bottom = 42;
+    const plotWidth = width - left - right;
+    const plotHeight = height - top - bottom;
+    const now = Date.now();
+    const start = now - 6 * 60 * 60 * 1000;
+    const maxCount = Math.max(1, ...points.map(point => point.star_count));
+    const x = time => left + ((time - start) / (now - start)) * plotWidth;
+    const y = count => top + plotHeight - (count / maxCount) * plotHeight;
+    function add(tag, attributes, text) {{
+      const element = document.createElementNS(svgNamespace, tag);
+      for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+      if (text !== undefined) element.textContent = text;
+      chart.append(element);
+      return element;
+    }}
+    for (let tick = 0; tick <= 4; tick++) {{
+      const value = maxCount * tick / 4;
+      const yPosition = y(value);
+      add("line", {{x1: left, y1: yPosition, x2: width - right, y2: yPosition, stroke: "#dce3e9"}});
+      add("text", {{x: left - 10, y: yPosition + 4, "text-anchor": "end"}}, Math.round(value).toString());
+    }}
+    add("text", {{x: left, y: height - 10}}, new Date(start).toLocaleTimeString([], {{hour: "2-digit", minute: "2-digit"}}));
+    add("text", {{x: width - right, y: height - 10, "text-anchor": "end"}}, "now");
+    const coordinates = points.map(point => {{
+      const timestamp = Date.parse(point.captured_at);
+      return [x(timestamp), y(point.star_count)];
+    }}).filter(point => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+    if (coordinates.length) {{
+      add("polyline", {{
+        points: coordinates.map(point => point.join(",")).join(" "),
+        fill: "none", stroke: "#174f78", "stroke-width": 3,
+        "stroke-linejoin": "round", "stroke-linecap": "round"
+      }});
+      for (const [pointX, pointY] of coordinates) {{
+        add("circle", {{cx: pointX, cy: pointY, r: 4, fill: "#174f78"}});
+      }}
+    }}
+  }}
+
+  async function checkForNewImage() {{
+    try {{
+      const response = await fetch("/api/status", {{cache: "no-store"}});
+      if (!response.ok) throw new Error(`Status request failed: ${{response.status}}`);
+      const status = await response.json();
+      if (status.latest_image && status.latest_version !== null) {{
+        const version = `${{status.latest_image}}:${{status.latest_version}}`;
+        let image = container.querySelector("img");
+        if (!image) {{
+          container.replaceChildren();
+          image = document.createElement("img");
+          image.className = "latest";
+          image.alt = "Latest all-sky image";
+          container.append(image);
+        }}
+        if (image.dataset.version !== version) {{
+          image.dataset.version = version;
+          image.src = `/latest.jpg?v=${{encodeURIComponent(version)}}`;
+          pathLabel.textContent = status.latest_image_path;
+        }}
+      }}
+      if (status.latest_star) {{
+        countLabel.textContent = status.latest_star.star_count.toLocaleString();
+        timeLabel.textContent = status.latest_star.captured_at;
+        timeLabel.dateTime = status.latest_star.captured_at;
+      }} else {{
+        countLabel.textContent = "—";
+        timeLabel.textContent = "Waiting for first capture";
+      }}
+      drawChart(status.star_series);
+    }} catch (error) {{
+      console.error("Could not check for a new all-sky image", error);
+    }}
+  }}
+  checkForNewImage();
+  window.setInterval(checkForNewImage, 3000);
+}})();
+</script>
 </body></html>"""
 
     def _send_html(self, content: str, status: int = 200) -> None:

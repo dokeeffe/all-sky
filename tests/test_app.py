@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
+import os
 import struct
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from PIL import Image
 
 from allsky_app import camera
 from allsky_app.camera import stamp_image
+from allsky_app.image_maintenance import prune_image_directory
 from allsky_app.settings import Settings, SettingsStore
 from allsky_app.star_store import StarStore
 from allsky_app.stars import count_stars
@@ -32,6 +35,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.indi_port, 7625)
         self.assertEqual(settings.exposure_seconds, 15.0)
         self.assertTrue(settings.auto_gain)
+        self.assertTrue(settings.save_fits)
+        self.assertTrue(settings.save_jpg)
+        self.assertEqual(settings.max_image_dir_gb, 5.0)
 
     def test_rejects_observatory_indi_port(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot be 7624"):
@@ -44,7 +50,12 @@ class SettingsTests(unittest.TestCase):
     def test_settings_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
-            original = Settings(image_dir="/tmp/allsky", exposure_seconds=18.5)
+            original = Settings(
+                image_dir="/tmp/allsky",
+                exposure_seconds=18.5,
+                save_fits=False,
+                max_image_dir_gb=7,
+            )
             store.save(original)
             self.assertEqual(store.load(), original)
 
@@ -90,6 +101,25 @@ class CameraCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid base64"):
             camera.decode_blob("%%% not base64 %%%", ".fits")
 
+    def test_saves_only_selected_image_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fits_data = make_fits_image()
+            base = root / "fits-only"
+            camera.save_outputs(fits_data, base, save_fits=True, save_jpg=False)
+            self.assertTrue(base.with_suffix(".fits").exists())
+            self.assertFalse(base.with_suffix(".jpg").exists())
+
+            base = root / "jpg-only"
+            camera.save_outputs(fits_data, base, save_fits=False, save_jpg=True)
+            self.assertFalse(base.with_suffix(".fits").exists())
+            self.assertTrue(base.with_suffix(".jpg").exists())
+
+            base = root / "no-files"
+            camera.save_outputs(fits_data, base, save_fits=False, save_jpg=False)
+            self.assertFalse(base.with_suffix(".fits").exists())
+            self.assertFalse(base.with_suffix(".jpg").exists())
+
     def test_capture_saves_files_without_loading_sample_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fits_data = make_fits_image()
@@ -129,20 +159,70 @@ class CameraCaptureTests(unittest.TestCase):
                 patch.object(camera, "IndiClient", FakeIndiClient),
                 patch.object(camera, "stamp_image") as stamp,
             ):
-                settings = Settings(image_dir=directory)
+                settings = Settings(
+                    image_dir=directory,
+                    save_fits=False,
+                    save_jpg=False,
+                )
                 base_path, captured_at, star_count = camera.capture_frame(settings)
 
             start_server.assert_called_once_with(7625, "indi_asi_ccd")
-            stamp.assert_called_once()
+            stamp.assert_not_called()
             self.assertEqual(base_path.parent, Path(directory))
             self.assertRegex(base_path.name, r"^allsky-\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d$")
-            self.assertTrue(base_path.with_suffix(".fits").is_file())
-            self.assertTrue(base_path.with_suffix(".jpg").is_file())
+            self.assertFalse(base_path.with_suffix(".fits").exists())
+            self.assertFalse(base_path.with_suffix(".jpg").exists())
             self.assertEqual(star_count, 0)
             self.assertIsInstance(captured_at, datetime)
 
 
 class StoreAndSafetyTests(unittest.TestCase):
+    def test_storage_cleanup_is_rate_limited_to_five_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worker = CaptureWorker(
+                SettingsStore(Path(directory) / "settings.json"),
+                StarStore(Path(directory) / "stars.sqlite3"),
+            )
+            settings = Settings(image_dir=directory)
+            with (
+                patch("allsky_app.worker.time.monotonic", side_effect=[10, 100, 311]),
+                patch("allsky_app.worker.prune_image_directory") as prune,
+            ):
+                worker._maybe_prune_images(settings)
+                worker._maybe_prune_images(settings)
+                worker._maybe_prune_images(settings)
+            self.assertEqual(prune.call_count, 2)
+
+    def test_prunes_oldest_camera_image_sets_in_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_fits = root / "allsky-old.fits"
+            old_jpg = root / "allsky-old.jpg"
+            new_fits = root / "allsky-new.fits"
+            new_jpg = root / "allsky-new.jpg"
+            unrelated = root / "notes.txt"
+            for path, data in (
+                (old_fits, b"123"),
+                (old_jpg, b"456"),
+                (new_fits, b"7890"),
+                (new_jpg, b"abcd"),
+                (unrelated, b"leave"),
+            ):
+                path.write_bytes(data)
+            os.utime(old_fits, (1, 1))
+            os.utime(old_jpg, (1, 1))
+            os.utime(new_fits, (2, 2))
+            os.utime(new_jpg, (2, 2))
+
+            reclaimed = prune_image_directory(root, max_bytes=10, batch_bytes=5)
+
+            self.assertEqual(reclaimed, 6)
+            self.assertFalse(old_fits.exists())
+            self.assertFalse(old_jpg.exists())
+            self.assertTrue(new_fits.exists())
+            self.assertTrue(new_jpg.exists())
+            self.assertTrue(unrelated.exists())
+
     def test_star_counts_are_persisted_in_time_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StarStore(Path(directory) / "stars.sqlite3")
@@ -153,6 +233,18 @@ class StoreAndSafetyTests(unittest.TestCase):
             store.add(first, 4, datetime(2026, 1, 1, tzinfo=timezone.utc))
             store.add(second, 9, datetime(2026, 1, 2, tzinfo=timezone.utc))
             self.assertEqual([row["star_count"] for row in store.recent(2)], [9, 4])
+
+    def test_latest_value_and_six_hour_series(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StarStore(Path(directory) / "stars.sqlite3")
+            now = datetime.now(timezone.utc)
+            store.add(Path(directory) / "old.fits", 1, now - timedelta(hours=7))
+            store.add(Path(directory) / "recent.fits", 12, now - timedelta(hours=2))
+            store.add(Path(directory) / "latest.fits", 18, now)
+
+            self.assertEqual(store.latest()["star_count"], 18)
+            series = store.since(6)
+            self.assertEqual([row["star_count"] for row in series], [12, 18])
 
     def test_closed_safety_result_is_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -205,18 +297,51 @@ class WebTests(unittest.TestCase):
     def test_dashboard_and_latest_image(self) -> None:
         page = urlopen(self.base_url).read().decode()
         self.assertIn("All-sky camera", page)
+        self.assertIn("Latest star count", page)
+        self.assertIn("Camera settings", page)
+        self.assertIn("<details>", page)
+        self.assertIn('id="star-chart"', page)
+        self.assertNotIn("<table>", page)
+        self.assertIn('name="save_fits"', page)
+        self.assertIn('name="save_jpg"', page)
+        self.assertIn('value="5"', page)
+        self.assertIn("batches of about 200 MiB", page)
         image = self.image_dir / "allsky-2026-11-26-21-39-02.jpg"
         image.write_bytes(b"jpeg data")
         response = urlopen(f"{self.base_url}/latest.jpg")
         self.assertEqual(response.headers["Content-Type"], "image/jpeg")
         self.assertEqual(response.read(), b"jpeg data")
+        response = urlopen(f"{self.base_url}/latest.jpg?v=unique")
+        self.assertEqual(response.read(), b"jpeg data")
+
+    def test_status_api_reports_latest_image_version(self) -> None:
+        image = self.image_dir / "allsky-2026-11-26-21-39-02.jpg"
+        image.write_bytes(b"jpeg data")
+        self.stars.add(
+            image.with_suffix(".fits"),
+            42,
+            datetime.now(timezone.utc),
+        )
+        response = urlopen(f"{self.base_url}/api/status")
+        status = json.loads(response.read())
+        self.assertEqual(status["latest_image"], image.name)
+        self.assertEqual(status["latest_image_path"], str(image))
+        self.assertIsInstance(status["latest_version"], int)
+        self.assertEqual(status["latest_star"]["star_count"], 42)
+        self.assertEqual(status["star_series"][-1]["star_count"], 42)
+
+    def test_dashboard_has_auto_refresh_polling(self) -> None:
+        page = urlopen(self.base_url).read().decode()
+        self.assertIn("window.setInterval(checkForNewImage, 3000)", page)
+        self.assertIn("drawChart(status.star_series)", page)
 
     def test_saves_valid_settings(self) -> None:
         data = (
             "image_dir=%2Ftmp%2Fupdated&indi_driver=indi_asi_ccd"
             "&device_name=Camera&indi_port=7625&exposure_seconds=20"
             "&delay_seconds=2&safety_script=&safety_check_minutes=5"
-            "&manual_gain=&auto_gain=yes"
+            "&manual_gain=&auto_gain=yes&save_fits=yes&save_jpg=yes"
+            "&max_image_dir_gb=5"
         )
         request = Request(
             f"{self.base_url}/settings",
@@ -230,6 +355,29 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.settings.load().image_dir, "/tmp/updated")
         self.assertEqual(self.settings.load().exposure_seconds, 20)
         self.assertTrue(self.settings.load().auto_gain)
+        self.assertTrue(self.settings.load().save_fits)
+        self.assertTrue(self.settings.load().save_jpg)
+        self.assertEqual(self.settings.load().max_image_dir_gb, 5)
+
+    def test_settings_form_can_disable_jpeg(self) -> None:
+        data = (
+            "image_dir=%2Ftmp%2Fupdated&indi_driver=indi_asi_ccd"
+            "&device_name=Camera&indi_port=7625&exposure_seconds=20"
+            "&delay_seconds=2&safety_script=&safety_check_minutes=5"
+            "&manual_gain=&auto_gain=yes&save_fits=yes&max_image_dir_gb=3"
+        )
+        request = Request(
+            f"{self.base_url}/settings",
+            data=data.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+        saved = self.settings.load()
+        self.assertTrue(saved.save_fits)
+        self.assertFalse(saved.save_jpg)
+        self.assertEqual(saved.max_image_dir_gb, 3)
 
     def test_rejects_main_observatory_port(self) -> None:
         data = (

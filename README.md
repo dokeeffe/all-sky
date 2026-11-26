@@ -60,6 +60,13 @@ The default image capture uses a 15-second exposure and a 1-second delay.
 With automatic/default gain enabled, the application leaves the driver's gain
 setting alone. If automatic/default gain is disabled, supply a manual gain;
 that numeric value is sent using the INDI `CCD_CONTROLS` `Gain` property.
+FITS and JPEG saving can be enabled independently in Camera settings; star
+counts are still calculated from the downloaded FITS frame even when FITS is
+not saved. Both formats are enabled by default. The image-storage limit
+defaults to 5 GB. Every five minutes, the service checks its managed
+`allsky-*.fits` and `allsky-*.jpg` files and, if they exceed the configured
+limit, removes oldest image sets in batches of approximately 200 MiB. Other
+files in the image directory are not included in the limit or deleted.
 
 ## Roof safety script
 
@@ -71,10 +78,12 @@ caches that result in between checks. An unset safety script allows capture.
 
 ## Star counts and tests
 
-Star counts are approximate detections of isolated image peaks above a robust
-background-noise threshold; use them to follow changing sky conditions rather
-than as a scientific photometry measurement. Tests do not require a connected
-camera:
+The dashboard shows the latest recorded star count beside the live image and
+plots the count history for the most recent six hours. Both refresh with new
+captures; camera settings are tucked into a collapsed panel. Counts are
+approximate detections of isolated image peaks above a robust background-noise
+threshold, useful for following sky conditions rather than as scientific
+photometry. Tests do not require a connected camera:
 
 ```sh
 uv run python -m unittest discover -s tests -v

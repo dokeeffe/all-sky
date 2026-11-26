@@ -21,6 +21,9 @@ class Settings:
     auto_gain: bool = True
     manual_gain: float | None = None
     indi_port: int = 7625
+    save_fits: bool = True
+    save_jpg: bool = True
+    max_image_dir_gb: float = 5.0
 
     def validate(self) -> Settings:
         if not self.image_dir.strip():
@@ -36,6 +39,8 @@ class Settings:
             or not 0.1 <= self.safety_check_minutes <= 1440
         ):
             raise ValueError("Safety check interval must be between 0.1 and 1440 minutes")
+        if not math.isfinite(self.max_image_dir_gb) or not 0.1 <= self.max_image_dir_gb <= 100_000:
+            raise ValueError("Image directory limit must be between 0.1 and 100000 GB")
         if (
             not 1024 <= self.indi_port <= 65535
             or self.indi_port == 7624
@@ -61,12 +66,14 @@ class Settings:
         for key in ("image_dir", "indi_driver", "device_name", "safety_script"):
             if not isinstance(merged[key], str):
                 raise ValueError(f"{key} must be text")
-        if type(merged["auto_gain"]) is not bool:
-            raise ValueError("auto_gain must be a boolean")
+        for key in ("auto_gain", "save_fits", "save_jpg"):
+            if type(merged[key]) is not bool:
+                raise ValueError(f"{key} must be a boolean")
         try:
             merged["exposure_seconds"] = float(merged["exposure_seconds"])
             merged["delay_seconds"] = float(merged["delay_seconds"])
             merged["safety_check_minutes"] = float(merged["safety_check_minutes"])
+            merged["max_image_dir_gb"] = float(merged["max_image_dir_gb"])
             port = merged["indi_port"]
             if isinstance(port, bool):
                 raise ValueError("INDI port must be an integer")

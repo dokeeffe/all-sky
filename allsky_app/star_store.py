@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -43,5 +43,27 @@ class StarStore:
                 "SELECT captured_at, image_path, star_count FROM star_counts "
                 "ORDER BY captured_at DESC, id DESC LIMIT ?",
                 (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest(self) -> dict[str, str | int] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT captured_at, image_path, star_count FROM star_counts "
+                "ORDER BY captured_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def since(self, hours: float = 6) -> list[dict[str, str | int]]:
+        if hours <= 0:
+            raise ValueError("Time-series window must be positive")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(
+            timespec="seconds"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT captured_at, image_path, star_count FROM star_counts "
+                "WHERE captured_at >= ? ORDER BY captured_at ASC, id ASC",
+                (cutoff,),
             ).fetchall()
         return [dict(row) for row in rows]

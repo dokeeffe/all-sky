@@ -31,7 +31,10 @@ if [[ ! -e "$CONFIG_DIR/settings.json" ]]; then
   "safety_check_minutes": 5.0,
   "auto_gain": true,
   "manual_gain": null,
-  "indi_port": 7625
+  "indi_port": 7625,
+  "save_fits": true,
+  "save_jpg": true,
+  "max_image_dir_gb": 5.0
 }
 JSON
 fi

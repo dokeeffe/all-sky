@@ -248,12 +248,22 @@ def fits_to_uint8(data: bytes, stretch: bool = True) -> np.ndarray:
     return np.clip(array, 0, 255).astype(np.uint8)
 
 
-def save_outputs(fits_data: bytes, base_path: Path, stretch: bool = True) -> None:
+def save_outputs(
+    fits_data: bytes,
+    base_path: Path,
+    stretch: bool = True,
+    *,
+    save_fits: bool = True,
+    save_jpg: bool = True,
+) -> None:
+    if not save_fits and not save_jpg:
+        return
     base_path.parent.mkdir(parents=True, exist_ok=True)
-    fits_path = base_path.with_suffix(".fits")
-    fits_path.write_bytes(fits_data)
-    image = Image.fromarray(fits_to_uint8(fits_data, stretch))
-    image.save(base_path.with_suffix(".jpg"), format="JPEG", quality=92)
+    if save_fits:
+        base_path.with_suffix(".fits").write_bytes(fits_data)
+    if save_jpg:
+        image = Image.fromarray(fits_to_uint8(fits_data, stretch))
+        image.save(base_path.with_suffix(".jpg"), format="JPEG", quality=92)
 
 
 def decode_blob(encoded_blob: str, blob_format: str) -> bytes:
@@ -326,8 +336,18 @@ def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
 
         filename_stamp = captured_at.strftime("%Y-%m-%d-%H-%M-%S")
         base_path = Path(settings.image_dir).expanduser() / f"allsky-{filename_stamp}"
-        save_outputs(fits_data, base_path, stretch=True)
-        stamp_image(base_path.with_suffix(".jpg"), captured_at.strftime("%Y-%m-%d %H-%M-%S"))
+        save_outputs(
+            fits_data,
+            base_path,
+            stretch=True,
+            save_fits=settings.save_fits,
+            save_jpg=settings.save_jpg,
+        )
+        if settings.save_jpg:
+            stamp_image(
+                base_path.with_suffix(".jpg"),
+                captured_at.strftime("%Y-%m-%d %H-%M-%S"),
+            )
         star_count = count_stars(fits_to_uint8(fits_data))
         return base_path, captured_at, star_count
     finally:
