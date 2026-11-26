@@ -6,6 +6,8 @@ import binascii
 import logging
 import socket
 import subprocess
+import os
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zlib
@@ -284,7 +286,10 @@ def decode_blob(encoded_blob: str, blob_format: str) -> bytes:
     return data
 
 
-def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
+def capture_frame(
+    settings: Settings,
+    upload_preview_path: Path | None = None,
+) -> tuple[Path, datetime, int]:
     settings.validate()
     start_indi_server(settings.indi_port, settings.indi_driver)
     client = IndiClient(settings.device_name, settings.indi_port)
@@ -348,6 +353,26 @@ def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
                 base_path.with_suffix(".jpg"),
                 captured_at.strftime("%Y-%m-%d %H-%M-%S"),
             )
+        elif settings.s3_upload:
+            if upload_preview_path is None:
+                raise ValueError("An upload preview path is required for S3 JPEG uploads")
+            upload_preview_path.parent.mkdir(parents=True, exist_ok=True)
+            preview = Image.fromarray(fits_to_uint8(fits_data, stretch=True))
+            temp_name: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=upload_preview_path.parent,
+                    prefix=".latest-upload-",
+                    suffix=".jpg",
+                    delete=False,
+                ) as temp_file:
+                    temp_name = temp_file.name
+                preview.save(temp_name, format="JPEG", quality=92)
+                stamp_image(Path(temp_name), captured_at.strftime("%Y-%m-%d %H-%M-%S"))
+                os.replace(temp_name, upload_preview_path)
+            finally:
+                if temp_name is not None and os.path.exists(temp_name):
+                    os.unlink(temp_name)
         star_count = count_stars(fits_to_uint8(fits_data))
         return base_path, captured_at, star_count
     finally:

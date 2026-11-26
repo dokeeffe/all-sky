@@ -21,6 +21,7 @@ from PIL import Image
 from allsky_app import camera
 from allsky_app.camera import stamp_image
 from allsky_app.image_maintenance import prune_image_directory
+from allsky_app.s3_upload import S3UploadWorker, latest_jpeg, upload_latest
 from allsky_app.settings import Settings, SettingsStore
 from allsky_app.star_store import StarStore
 from allsky_app.stars import count_stars
@@ -47,6 +48,24 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manual gain"):
             Settings.from_mapping({"auto_gain": False})
 
+    def test_s3_upload_requires_all_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Required when S3 upload is enabled"):
+            Settings.from_mapping({"s3_upload": True})
+
+    def test_s3_upload_validates_interval_and_endpoint(self) -> None:
+        values = {
+            "s3_upload": True,
+            "s3_upload_interval_minutes": 5,
+            "s3_bucket_name": "allsky",
+            "s3_object_key": "current.jpg",
+            "s3_access_key_id": "access",
+            "s3_secret": "secret",
+            "s3_endpoint": "https://s3.example.test",
+        }
+        self.assertEqual(Settings.from_mapping(values).s3_upload_interval_minutes, 5)
+        with self.assertRaisesRegex(ValueError, "endpoint must be"):
+            Settings.from_mapping({**values, "s3_endpoint": "not-an-endpoint"})
+
     def test_settings_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
@@ -58,6 +77,7 @@ class SettingsTests(unittest.TestCase):
             )
             store.save(original)
             self.assertEqual(store.load(), original)
+            self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
 
 
 class StarCountTests(unittest.TestCase):
@@ -175,8 +195,140 @@ class CameraCaptureTests(unittest.TestCase):
             self.assertEqual(star_count, 0)
             self.assertIsInstance(captured_at, datetime)
 
+    def test_s3_upload_can_use_a_temporary_jpeg_when_jpg_saving_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fits_data = make_fits_image()
+            preview_path = root / "state" / "latest-upload.jpg"
+
+            class FakeIndiClient:
+                def __init__(self, device: str, port: int) -> None:
+                    self.props = {
+                        "CONNECTION": {"CONNECT": "On"},
+                        "CCD_EXPOSURE": {"CCD_EXPOSURE_VALUE": "15"},
+                        "CCD_INFO": {"CCD_MAX_X": "3", "CCD_MAX_Y": "3"},
+                        "UPLOAD_MODE": {"UPLOAD_CLIENT": "On"},
+                    }
+                    self.states: dict[str, str] = {}
+                    self.blobs: list[tuple[str, str]] = []
+
+                def close(self) -> None:
+                    pass
+
+                def set_switch(self, name: str, element: str) -> None:
+                    pass
+
+                def set_numbers(self, name: str, **values: float) -> None:
+                    if name == "CCD_EXPOSURE":
+                        encoded = base64.b64encode(fits_data).decode("ascii")
+                        self.blobs.append((".fits", encoded))
+
+                def pump(self) -> None:
+                    pass
+
+                def wait(self, condition, timeout: float, description: str) -> None:
+                    if not condition():
+                        raise TimeoutError(description)
+
+            settings = Settings(
+                image_dir=str(root / "images"),
+                save_fits=False,
+                save_jpg=False,
+                s3_upload=True,
+                s3_upload_interval_minutes=5,
+                s3_bucket_name="bucket",
+                s3_object_key="latest.jpg",
+                s3_access_key_id="access",
+                s3_secret="secret",
+                s3_endpoint="https://s3.example.test",
+            )
+            with (
+                patch.object(camera, "start_indi_server"),
+                patch.object(camera, "IndiClient", FakeIndiClient),
+            ):
+                camera.capture_frame(settings, upload_preview_path=preview_path)
+
+            self.assertTrue(preview_path.is_file())
+            self.assertFalse((root / "images").exists())
+
 
 class StoreAndSafetyTests(unittest.TestCase):
+    def test_latest_jpeg_selects_most_recent_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "allsky-first.jpg"
+            second = root / "allsky-second.jpg"
+            first.write_bytes(b"old")
+            second.write_bytes(b"new")
+            os.utime(first, (1, 1))
+            os.utime(second, (2, 2))
+            settings = Settings(
+                image_dir=directory,
+                s3_upload=True,
+                s3_upload_interval_minutes=1,
+                s3_bucket_name="bucket",
+                s3_object_key="latest.jpg",
+                s3_access_key_id="access",
+                s3_secret="secret",
+                s3_endpoint="https://s3.example.test",
+            )
+            self.assertEqual(latest_jpeg(settings, root / "fallback.jpg"), second)
+
+    def test_upload_uses_configured_credentials_and_overwrites_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "latest.jpg"
+            image.write_bytes(b"jpeg")
+            settings = Settings(
+                s3_upload=True,
+                s3_upload_interval_minutes=5,
+                s3_bucket_name="observatory",
+                s3_object_key="allsky/current.jpg",
+                s3_access_key_id="configured-access",
+                s3_secret="configured-secret",
+                s3_endpoint="https://objects.example.test",
+            )
+            with patch("allsky_app.s3_upload.boto3.client") as client_factory:
+                upload_latest(settings, image)
+            client_factory.assert_called_once_with(
+                "s3",
+                endpoint_url="https://objects.example.test",
+                aws_access_key_id="configured-access",
+                aws_secret_access_key="configured-secret",
+                region_name="auto",
+            )
+            client_factory.return_value.upload_file.assert_called_once_with(
+                str(image), "observatory", "allsky/current.jpg"
+            )
+
+    def test_upload_worker_uploads_immediately_and_reloads_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root / "settings.json")
+            settings = Settings(
+                s3_upload=True,
+                s3_upload_interval_minutes=5,
+                s3_bucket_name="bucket",
+                s3_object_key="latest.jpg",
+                s3_access_key_id="access",
+                s3_secret="secret",
+                s3_endpoint="https://s3.example.test",
+            )
+            store.save(settings)
+            preview = root / "latest-upload.jpg"
+            preview.write_bytes(b"jpg")
+            uploader = S3UploadWorker(store, preview)
+            uploaded = threading.Event()
+
+            def upload(_settings: Settings, _path: Path) -> None:
+                uploaded.set()
+                uploader.stop()
+
+            with patch("allsky_app.s3_upload.upload_latest", side_effect=upload):
+                uploader.run()
+
+            self.assertTrue(uploaded.is_set())
+            self.assertEqual(uploader.status()["phase"], "stopped")
+
     def test_storage_cleanup_is_rate_limited_to_five_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             worker = CaptureWorker(
@@ -306,6 +458,7 @@ class WebTests(unittest.TestCase):
         self.assertIn('name="save_jpg"', page)
         self.assertIn('value="5"', page)
         self.assertIn("batches of about 200 MiB", page)
+        self.assertIn("Enable periodic latest-JPEG upload", page)
         image = self.image_dir / "allsky-2026-11-26-21-39-02.jpg"
         image.write_bytes(b"jpeg data")
         response = urlopen(f"{self.base_url}/latest.jpg")
@@ -341,7 +494,8 @@ class WebTests(unittest.TestCase):
             "&device_name=Camera&indi_port=7625&exposure_seconds=20"
             "&delay_seconds=2&safety_script=&safety_check_minutes=5"
             "&manual_gain=&auto_gain=yes&save_fits=yes&save_jpg=yes"
-            "&max_image_dir_gb=5"
+            "&max_image_dir_gb=5&s3_upload_interval_minutes="
+            "&s3_bucket_name=&s3_object_key=&s3_access_key_id=&s3_secret=&s3_endpoint="
         )
         request = Request(
             f"{self.base_url}/settings",
@@ -365,6 +519,8 @@ class WebTests(unittest.TestCase):
             "&device_name=Camera&indi_port=7625&exposure_seconds=20"
             "&delay_seconds=2&safety_script=&safety_check_minutes=5"
             "&manual_gain=&auto_gain=yes&save_fits=yes&max_image_dir_gb=3"
+            "&s3_upload_interval_minutes=&s3_bucket_name=&s3_object_key="
+            "&s3_access_key_id=&s3_secret=&s3_endpoint="
         )
         request = Request(
             f"{self.base_url}/settings",
@@ -378,6 +534,59 @@ class WebTests(unittest.TestCase):
         self.assertTrue(saved.save_fits)
         self.assertFalse(saved.save_jpg)
         self.assertEqual(saved.max_image_dir_gb, 3)
+
+    def test_s3_settings_are_saved_and_credentials_are_not_rendered(self) -> None:
+        data = (
+            "image_dir=%2Ftmp%2Fupdated&indi_driver=indi_asi_ccd"
+            "&device_name=Camera&indi_port=7625&exposure_seconds=20"
+            "&delay_seconds=2&safety_script=&safety_check_minutes=5"
+            "&manual_gain=&auto_gain=yes&save_fits=yes&save_jpg=yes"
+            "&max_image_dir_gb=5&s3_upload=yes&s3_upload_interval_minutes=10"
+            "&s3_bucket_name=observatory&s3_object_key=current.jpg"
+            "&s3_access_key_id=sample-access&s3_secret=sample-secret"
+            "&s3_endpoint=https%3A%2F%2Fobjects.example.test"
+        )
+        request = Request(
+            f"{self.base_url}/settings",
+            data=data.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+        saved = self.settings.load()
+        self.assertTrue(saved.s3_upload)
+        self.assertEqual(saved.s3_upload_interval_minutes, 10)
+        self.assertEqual(saved.s3_bucket_name, "observatory")
+        self.assertEqual(saved.s3_object_key, "current.jpg")
+        self.assertEqual(saved.s3_access_key_id, "sample-access")
+        self.assertEqual(saved.s3_secret, "sample-secret")
+        self.assertEqual(saved.s3_endpoint, "https://objects.example.test")
+        page = urlopen(self.base_url).read().decode()
+        self.assertNotIn("sample-secret", page)
+        self.assertNotIn("sample-access", page)
+        self.assertIn("saved; blank keeps current", page)
+
+    def test_enabled_s3_form_rejects_missing_required_configuration(self) -> None:
+        data = (
+            "image_dir=%2Ftmp%2Fupdated&indi_driver=indi_asi_ccd"
+            "&device_name=Camera&indi_port=7625&exposure_seconds=20"
+            "&delay_seconds=2&safety_script=&safety_check_minutes=5"
+            "&manual_gain=&auto_gain=yes&save_fits=yes&save_jpg=yes"
+            "&max_image_dir_gb=5&s3_upload=yes&s3_upload_interval_minutes="
+            "&s3_bucket_name=&s3_object_key=&s3_access_key_id=&s3_secret=&s3_endpoint="
+        )
+        request = Request(
+            f"{self.base_url}/settings",
+            data=data.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request)
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn(b"Required when S3 upload is enabled", error.exception.read())
+        error.exception.close()
 
     def test_rejects_main_observatory_port(self) -> None:
         data = (

@@ -68,6 +68,19 @@ defaults to 5 GB. Every five minutes, the service checks its managed
 limit, removes oldest image sets in batches of approximately 200 MiB. Other
 files in the image directory are not included in the limit or deleted.
 
+## S3-compatible uploads
+
+Enable periodic JPEG uploads in Camera settings and provide an upload interval
+in minutes, bucket name, object key, access key ID, secret access key, and
+endpoint URL. The service uses the supplied credentials directly with boto3
+(it does not read AWS credentials from environment variables) and uploads to
+the same bucket/key each time, replacing that object with the latest JPEG.
+With JPEG saving disabled, a single temporary JPEG is kept in the application
+state directory for uploads instead of saving JPEGs alongside the captures.
+The settings JSON, including credentials, is written with owner-only
+permissions; keep it private and use a bucket key with only the required
+write permissions.
+
 ## Roof safety script
 
 Optionally set an executable script path in the web UI. The service runs it

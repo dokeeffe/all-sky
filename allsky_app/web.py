@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from PIL import Image
 
 from .camera import fits_to_uint8
+from .s3_upload import S3UploadWorker
 from .settings import Settings, SettingsStore
 from .star_store import StarStore
 from .worker import CaptureWorker
@@ -24,10 +25,12 @@ class Dashboard:
         settings: SettingsStore,
         stars: StarStore,
         worker: CaptureWorker,
+        uploader: S3UploadWorker | None = None,
     ) -> None:
         self.settings = settings
         self.stars = stars
         self.worker = worker
+        self.uploader = uploader
 
     def latest_image(self) -> Path | None:
         settings = self.settings.load()
@@ -104,6 +107,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 latest_version = None
             self._send_json({
                 "worker": self.dashboard.worker.status(),
+                "s3_upload": (
+                    self.dashboard.uploader.status()
+                    if self.dashboard.uploader is not None
+                    else {"phase": "disabled", "last_uploaded_at": None, "last_error": None}
+                ),
                 "latest_star": self.dashboard.stars.latest(),
                 "star_series": self.dashboard.stars.since(6),
                 "latest_image": latest.name if latest else None,
@@ -126,6 +134,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 keep_blank_values=True,
                 strict_parsing=True,
             )
+            s3_enabled = "s3_upload" in form
+            previous = self.dashboard.settings.load()
+            access_key_id = self._form_value(form, "s3_access_key_id")
+            secret = self._form_value(form, "s3_secret")
             settings = Settings.from_mapping({
                 "image_dir": self._form_value(form, "image_dir"),
                 "indi_driver": self._form_value(form, "indi_driver"),
@@ -140,6 +152,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "save_fits": "save_fits" in form,
                 "save_jpg": "save_jpg" in form,
                 "max_image_dir_gb": self._form_value(form, "max_image_dir_gb"),
+                "s3_upload": s3_enabled,
+                "s3_upload_interval_minutes": self._form_value(
+                    form, "s3_upload_interval_minutes"
+                ),
+                "s3_bucket_name": self._form_value(form, "s3_bucket_name"),
+                "s3_object_key": self._form_value(form, "s3_object_key"),
+                "s3_access_key_id": (
+                    access_key_id
+                    if access_key_id
+                    else previous.s3_access_key_id if s3_enabled else ""
+                ),
+                "s3_secret": (
+                    secret if secret else previous.s3_secret if s3_enabled else ""
+                ),
+                "s3_endpoint": self._form_value(form, "s3_endpoint"),
             })
             self.dashboard.settings.save(settings)
         except (UnicodeDecodeError, ValueError, OSError) as exc:
@@ -162,9 +189,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _render_page(self, error: str | None = None) -> str:
         settings = self.dashboard.settings.load()
         status = self.dashboard.worker.status()
+        uploader_status = (
+            self.dashboard.uploader.status()
+            if self.dashboard.uploader is not None
+            else {"phase": "disabled", "last_uploaded_at": None, "last_error": None}
+        )
         latest = self.dashboard.latest_image()
         checked = "checked" if settings.auto_gain else ""
         latest_star = self.dashboard.stars.latest()
+        s3_interval = (
+            f"{settings.s3_upload_interval_minutes:g}"
+            if settings.s3_upload_interval_minutes is not None
+            else ""
+        )
         try:
             latest_version = latest.stat().st_mtime_ns if latest else ""
         except OSError:
@@ -185,6 +222,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         status_text = html.escape(str(status["phase"]))
         safety_text = "not configured" if status["safety_open"] is None else (
             "open" if status["safety_open"] else "closed / blocked"
+        )
+        upload_text = html.escape(str(uploader_status["phase"]))
+        upload_time = uploader_status["last_uploaded_at"] or "not uploaded yet"
+        upload_error = uploader_status["last_error"]
+        upload_error_html = (
+            f'<span class="error">{html.escape(str(upload_error))}</span>'
+            if upload_error else ""
         )
         return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -207,6 +251,7 @@ summary{{cursor:pointer;font-size:1.2rem;font-weight:600}}details form{{padding-
 </style></head><body>
 <h1>All-sky camera</h1>
 <p class="muted">Capture service: <strong>{status_text}</strong> · Roof safety: <strong>{html.escape(safety_text)}</strong></p>
+<p class="muted">S3 upload: <strong id="s3-upload-status">{upload_text}</strong> · Last upload: <span id="s3-upload-time">{html.escape(str(upload_time))}</span> <span id="s3-upload-error" class="error">{html.escape(str(upload_error or ""))}</span></p>
 {error_html}
 <section><h2>Live sky</h2><div class="live-grid">
 <div><div id="image-container">{image_html}</div>
@@ -239,11 +284,35 @@ aria-label="Star count time series for the last six hours"></svg>
 <label for="max_image_dir_gb">Maximum camera image storage (GB)</label>
 <input id="max_image_dir_gb" name="max_image_dir_gb" type="number" min="0.1" max="100000" step="0.1" required value="{settings.max_image_dir_gb:g}">
 <p class="muted">Checked every 5 minutes. When exceeded, oldest all-sky FITS/JPEG image sets are removed in batches of about 200 MiB.</p>
+<fieldset><legend>S3-compatible upload</legend>
+<label><input id="s3_upload" type="checkbox" name="s3_upload" value="yes" {"checked" if settings.s3_upload else ""}> Enable periodic latest-JPEG upload</label>
+<label for="s3_upload_interval_minutes">Upload interval (minutes)</label>
+<input id="s3_upload_interval_minutes" name="s3_upload_interval_minutes" type="number" min="0.1" step="0.1" value="{s3_interval}">
+<label for="s3_bucket_name">Bucket name</label><input id="s3_bucket_name" name="s3_bucket_name" value="{html.escape(settings.s3_bucket_name, quote=True)}">
+<label for="s3_object_key">Object key (remote filename)</label><input id="s3_object_key" name="s3_object_key" value="{html.escape(settings.s3_object_key, quote=True)}">
+<label for="s3_access_key_id">Access key ID</label><input id="s3_access_key_id" name="s3_access_key_id" type="password" autocomplete="new-password" data-required-on-enable="{"false" if settings.s3_access_key_id else "true"}" placeholder="{"saved; blank keeps current" if settings.s3_access_key_id else ""}">
+<label for="s3_secret">Secret access key</label><input id="s3_secret" name="s3_secret" type="password" autocomplete="new-password" data-required-on-enable="{"false" if settings.s3_secret else "true"}" placeholder="{"saved; blank keeps current" if settings.s3_secret else ""}">
+<label for="s3_endpoint">S3 endpoint URL</label><input id="s3_endpoint" name="s3_endpoint" type="url" placeholder="https://..." value="{html.escape(settings.s3_endpoint, quote=True)}">
+<p class="muted">Credentials are stored in the local settings file with owner-only permissions. Existing keys are not displayed; leave either credential blank to keep it unchanged.</p>
+</fieldset>
 <label for="safety_script">Optional roof safety script (exit 0=open, 1=closed)</label><input id="safety_script" name="safety_script" value="{html.escape(settings.safety_script, quote=True)}">
 <label for="safety_check_minutes">Safety check/cache interval (minutes)</label><input id="safety_check_minutes" name="safety_check_minutes" type="number" min="0.1" max="1440" step="0.1" required value="{settings.safety_check_minutes:g}">
 <button type="submit">Save settings</button></form></details>
 <script>
 (() => {{
+  const s3Checkbox = document.getElementById("s3_upload");
+  const s3Fields = [
+    "s3_upload_interval_minutes", "s3_bucket_name", "s3_object_key",
+    "s3_access_key_id", "s3_secret", "s3_endpoint"
+  ].map(id => document.getElementById(id));
+  function updateS3Requirements() {{
+    for (const field of s3Fields) {{
+      field.required = s3Checkbox.checked && field.dataset.requiredOnEnable !== "false";
+    }}
+  }}
+  s3Checkbox.addEventListener("change", updateS3Requirements);
+  updateS3Requirements();
+
   const container = document.getElementById("image-container");
   const pathLabel = document.getElementById("latest-path");
   const countLabel = document.getElementById("latest-star-count");
@@ -304,6 +373,13 @@ aria-label="Star count time series for the last six hours"></svg>
       const response = await fetch("/api/status", {{cache: "no-store"}});
       if (!response.ok) throw new Error(`Status request failed: ${{response.status}}`);
       const status = await response.json();
+      const uploadStatus = status.s3_upload;
+      document.getElementById("s3-upload-status").textContent = uploadStatus.phase;
+      document.getElementById("s3-upload-time").textContent =
+        uploadStatus.last_uploaded_at || "not uploaded yet";
+      const uploadError = document.getElementById("s3-upload-error");
+      uploadError.textContent = uploadStatus.last_error || "";
+      uploadError.hidden = !uploadStatus.last_error;
       if (status.latest_image && status.latest_version !== null) {{
         const version = `${{status.latest_image}}:${{status.latest_version}}`;
         let image = container.querySelector("img");

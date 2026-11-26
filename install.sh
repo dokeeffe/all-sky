@@ -34,10 +34,19 @@ if [[ ! -e "$CONFIG_DIR/settings.json" ]]; then
   "indi_port": 7625,
   "save_fits": true,
   "save_jpg": true,
-  "max_image_dir_gb": 5.0
+  "max_image_dir_gb": 5.0,
+  "s3_upload": false,
+  "s3_upload_interval_minutes": null,
+  "s3_bucket_name": "",
+  "s3_object_key": "",
+  "s3_access_key_id": "",
+  "s3_secret": "",
+  "s3_endpoint": ""
 }
 JSON
 fi
+
+chmod 600 "$CONFIG_DIR/settings.json"
 
 cat > "$UNIT_DIR/allsky-camera.service" <<UNIT
 [Unit]

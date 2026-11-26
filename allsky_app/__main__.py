@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 from .settings import SettingsStore
+from .s3_upload import S3UploadWorker
 from .star_store import StarStore
 from .web import Dashboard, serve
 from .worker import CaptureWorker
@@ -38,24 +39,32 @@ def main() -> None:
     settings.load().validate()
     stars = StarStore(args.state_dir / "stars.sqlite3")
     worker = CaptureWorker(settings, stars)
-    thread = threading.Thread(target=worker.run, name="capture-worker", daemon=True)
-    thread.start()
+    uploader = S3UploadWorker(settings, args.state_dir / "latest-upload.jpg")
+    threads = [
+        threading.Thread(target=worker.run, name="capture-worker", daemon=True),
+        threading.Thread(target=uploader.run, name="s3-upload-worker", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
 
     def stop_service(signum: int, frame: object) -> None:
         del frame
         logging.info("Received shutdown signal %d", signum)
         worker.stop()
+        uploader.stop()
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
     try:
-        serve(Dashboard(settings, stars, worker), args.host, args.port)
+        serve(Dashboard(settings, stars, worker, uploader), args.host, args.port)
     except KeyboardInterrupt:
         pass
     finally:
         worker.stop()
-        thread.join(timeout=10)
+        uploader.stop()
+        for thread in threads:
+            thread.join(timeout=10)
 
 
 if __name__ == "__main__":

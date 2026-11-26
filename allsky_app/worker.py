@@ -56,7 +56,10 @@ class CaptureWorker:
                         self._set_status(last_error=f"Image cleanup failed: {exc}")
                     if self.check_safety(settings):
                         self._set_status(phase="capturing")
-                        base, captured_at, stars = capture_frame(settings)
+                        base, captured_at, stars = capture_frame(
+                            settings,
+                            upload_preview_path=self.stars.path.parent / "latest-upload.jpg",
+                        )
                         image_record = (
                             base.with_suffix(".fits")
                             if settings.save_fits
