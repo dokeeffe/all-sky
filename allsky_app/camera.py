@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import binascii
 import logging
 import socket
 import subprocess
@@ -255,6 +256,24 @@ def save_outputs(fits_data: bytes, base_path: Path, stretch: bool = True) -> Non
     image.save(base_path.with_suffix(".jpg"), format="JPEG", quality=92)
 
 
+def decode_blob(encoded_blob: str, blob_format: str) -> bytes:
+    try:
+        encoded = encoded_blob.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("INDI camera image BLOB contains non-ASCII data") from exc
+    encoded = encoded.translate(None, b" \t\r\n")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("INDI camera image BLOB contains invalid base64 data") from exc
+    if blob_format.endswith(".z"):
+        try:
+            data = zlib.decompress(data)
+        except zlib.error as exc:
+            raise ValueError("INDI camera image BLOB has invalid compressed data") from exc
+    return data
+
+
 def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
     settings.validate()
     start_indi_server(settings.indi_port, settings.indi_driver)
@@ -269,6 +288,8 @@ def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
                 client.props.get("CONNECTION", {}).get("CONNECT") == "On"
                 and "CCD_EXPOSURE" in client.props
                 and "CCD_INFO" in client.props
+                and float(client.props["CCD_INFO"].get("CCD_MAX_X", "0")) > 0
+                and float(client.props["CCD_INFO"].get("CCD_MAX_Y", "0")) > 0
                 and "UPLOAD_MODE" in client.props
             ),
             30,
@@ -301,9 +322,7 @@ def capture_frame(settings: Settings) -> tuple[Path, datetime, int]:
 
         client.wait(exposure_complete, settings.exposure_seconds + 30, "camera image")
         blob_format, encoded_blob = client.blobs[0]
-        fits_data = base64.b64decode(encoded_blob, validate=True)
-        if blob_format.endswith(".z"):
-            fits_data = zlib.decompress(fits_data)
+        fits_data = decode_blob(encoded_blob, blob_format)
 
         filename_stamp = captured_at.strftime("%Y-%m-%d-%H-%M-%S")
         base_path = Path(settings.image_dir).expanduser() / f"allsky-{filename_stamp}"

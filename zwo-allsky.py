@@ -31,30 +31,28 @@ JPEG_QUALITY = 92
 
 
 # ---- Server management ------------------------------------------------------
-def port_open(port: int = PORT) -> bool:
+def port_open() -> bool:
     try:
-        with socket.create_connection((HOST, port), timeout=1):
+        with socket.create_connection((HOST, PORT), timeout=1):
             return True
     except OSError:
         return False
 
 
-def start_server(port: int = PORT, driver: str = DRIVER) -> None:
-    if port == 7624:
-        raise ValueError("Port 7624 is reserved for the observatory's main INDI server")
-    if port_open(port):
+def start_server() -> None:
+    if port_open():
         return
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOGFILE, "ab")
     proc = subprocess.Popen(
-        ["indiserver", "-v", "-p", str(port), driver],
+        ["indiserver", "-v", "-p", str(PORT), DRIVER],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
         start_new_session=True,          # keeps running after this script exits
     )
     PIDFILE.write_text(str(proc.pid))
     for _ in range(40):
-        if port_open(port):
-            print(f"indiserver started on port {port} (PID {proc.pid})")
+        if port_open():
+            print(f"indiserver started on port {PORT} (PID {proc.pid})")
             return
         time.sleep(0.25)
     sys.exit(f"indiserver did not start - see {LOGFILE}")
@@ -78,9 +76,8 @@ def stop_server() -> None:
 class Indi:
     """Tiny INDI XML client. Keeps one connection open for the whole capture."""
 
-    def __init__(self, device: str = DEVICE, port: int = PORT) -> None:
-        self.device = device
-        self.sock = socket.create_connection((HOST, port), timeout=5)
+    def __init__(self) -> None:
+        self.sock = socket.create_connection((HOST, PORT), timeout=5)
         self.sock.settimeout(0.5)
         self.parser = ET.XMLPullParser(events=("start", "end"))
         self.parser.feed("<indi>")       # INDI is a stream with no single root
@@ -98,15 +95,15 @@ class Indi:
         self.sock.sendall(xml.encode())
 
     def enable_blobs(self) -> None:
-        self.send(f"<enableBLOB device='{self.device}'>Also</enableBLOB>")
+        self.send(f"<enableBLOB device='{DEVICE}'>Also</enableBLOB>")
 
     def set_switch(self, name: str, element: str) -> None:
-        self.send(f"<newSwitchVector device='{self.device}' name='{name}'>"
+        self.send(f"<newSwitchVector device='{DEVICE}' name='{name}'>"
                   f"<oneSwitch name='{element}'>On</oneSwitch></newSwitchVector>")
 
     def set_numbers(self, name: str, **values: float) -> None:
         items = "".join(f"<oneNumber name='{k}'>{v}</oneNumber>" for k, v in values.items())
-        self.send(f"<newNumberVector device='{self.device}' name='{name}'>{items}</newNumberVector>")
+        self.send(f"<newNumberVector device='{DEVICE}' name='{name}'>{items}</newNumberVector>")
 
     def pump(self) -> None:
         try:
@@ -128,10 +125,10 @@ class Indi:
     def handle(self, el: ET.Element) -> None:
         tag = el.tag
         if tag == "message":
-            if el.get("device") in (None, self.device):
+            if el.get("device") in (None, DEVICE):
                 print(f"  [driver] {el.get('message')}", file=sys.stderr)
             return
-        if el.get("device") != self.device:
+        if el.get("device") != DEVICE:
             return
         if tag == "setBLOBVector":
             for b in el.findall("oneBLOB"):
@@ -220,25 +217,12 @@ def save_outputs(fits_bytes: bytes, base: Path, formats: list[str], stretch: boo
 
 
 # ---- Capture ------------------------------------------------------------------
-def capture(
-    seconds: float,
-    gain: float | None,
-    formats: list[str],
-    stretch: bool,
-    *,
-    image_dir: Path = IMAGE_DIR,
-    driver: str = DRIVER,
-    device: str = DEVICE,
-    port: int = PORT,
-    auto_gain: bool = True,
-) -> Path:
-    if not auto_gain and gain is None:
-        raise ValueError("A manual gain value is required when auto gain is disabled")
-    start_server(port, driver)
-    c = Indi(device, port)
+def capture(seconds: float, gain: float | None, formats: list[str], stretch: bool) -> None:
+    start_server()
+    c = Indi()
     try:
         print("Waiting for camera...")
-        c.wait(lambda: "CONNECTION" in c.props, 30, f"'{device}' to appear (check name/USB)")
+        c.wait(lambda: "CONNECTION" in c.props, 30, f"'{DEVICE}' to appear (check name/USB)")
         c.enable_blobs()
 
         if c.props["CONNECTION"].get("CONNECT") != "On":
@@ -278,9 +262,7 @@ def capture(
         if fmt.endswith(".z"):           # driver compressed it
             data = zlib.decompress(data)
 
-        base = image_dir / f"allsky-{stamp}"
-        save_outputs(data, base, formats, stretch)
-        return base
+        save_outputs(data, IMAGE_DIR / f"allsky-{stamp}", formats, stretch)
     finally:
         c.close()
 
@@ -335,3 +317,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

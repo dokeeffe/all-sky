@@ -80,6 +80,16 @@ class StarCountTests(unittest.TestCase):
 
 
 class CameraCaptureTests(unittest.TestCase):
+    def test_decodes_indib_blob_with_wrapped_base64(self) -> None:
+        fits_data = make_fits_image()
+        encoded = base64.b64encode(fits_data).decode("ascii")
+        wrapped = f"\n  {encoded[:40]}\r\n{encoded[40:]} \t"
+        self.assertEqual(camera.decode_blob(wrapped, ".fits"), fits_data)
+
+    def test_rejects_non_base64_blob_data(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid base64"):
+            camera.decode_blob("%%% not base64 %%%", ".fits")
+
     def test_capture_saves_files_without_loading_sample_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fits_data = make_fits_image()
@@ -105,7 +115,7 @@ class CameraCaptureTests(unittest.TestCase):
                 def set_numbers(self, name: str, **values: float) -> None:
                     if name == "CCD_EXPOSURE":
                         encoded = base64.b64encode(fits_data).decode("ascii")
-                        self.blobs.append((".fits", encoded))
+                        self.blobs.append((".fits", f"\n{encoded[:64]}\n{encoded[64:]}"))
 
                 def pump(self) -> None:
                     pass
