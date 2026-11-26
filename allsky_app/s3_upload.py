@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import boto3
 
@@ -58,9 +58,11 @@ class S3UploadWorker:
         self,
         settings: SettingsStore,
         upload_preview_path: Path,
+        uploads_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings
         self.upload_preview_path = upload_preview_path.expanduser()
+        self.uploads_allowed = uploads_allowed or (lambda: True)
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._status: dict[str, Any] = {
@@ -105,6 +107,13 @@ class S3UploadWorker:
 
                 now = time.monotonic()
                 if now >= next_upload:
+                    if not self.uploads_allowed():
+                        self._set_status(
+                            phase="blocked by roof safety",
+                            last_error=None,
+                        )
+                        self.stop_event.wait(UPLOAD_POLL_SECONDS)
+                        continue
                     image = latest_jpeg(settings, self.upload_preview_path)
                     if image is None:
                         self._set_status(

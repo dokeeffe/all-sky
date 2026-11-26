@@ -41,6 +41,17 @@ class CaptureWorker:
         with self._lock:
             return dict(self._status)
 
+    def uploads_allowed(self) -> bool:
+        settings = self.settings.load()
+        if not settings.safety_script.strip():
+            return True
+        expected_key = (settings.safety_script.strip(), settings.safety_check_minutes)
+        with self._lock:
+            return (
+                self._safety_key == expected_key
+                and self._status["safety_open"] is True
+            )
+
     def stop(self) -> None:
         self.stop_event.set()
 
@@ -124,6 +135,7 @@ class CaptureWorker:
         if self._safety_key != key or now - self._safety_checked_monotonic >= interval:
             self._safety_key = key
             self._safety_checked_monotonic = now
+            self._set_status(safety_open=None)
             try:
                 result = subprocess.run(
                     [str(Path(script).expanduser())],

@@ -79,7 +79,8 @@ With JPEG saving disabled, a single temporary JPEG is kept in the application
 state directory for uploads instead of saving JPEGs alongside the captures.
 The settings JSON, including credentials, is written with owner-only
 permissions; keep it private and use a bucket key with only the required
-write permissions.
+write permissions. When a roof safety script is configured, uploads are
+paused unless its most recently checked result confirms the roof is open.
 
 ## Roof safety script
 
@@ -88,6 +89,31 @@ without a shell and interprets exit status `0` as roof open and safe to capture,
 `1` as roof closed, and any other exit status, timeout, or execution error as
 unsafe. It rechecks at the configured interval (five minutes by default) and
 caches that result in between checks. An unset safety script allows capture.
+
+For the observatory roof endpoint returning `{"state": "OPEN"}` or
+`{"state": "CLOSED"}`, save this as an executable script such as
+`~/bin/check-observatory-roof.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+response="$(curl --fail --silent --show-error --max-time 10 \
+  http://192.168.1.228:8080/roof)"
+state="$(jq -er '.state | select(. == "OPEN" or . == "CLOSED")' <<<"$response")"
+
+if [[ "$state" == "OPEN" ]]; then
+    exit 0
+fi
+
+exit 1
+```
+
+Make it executable with `chmod +x ~/bin/check-observatory-roof.sh` and enter
+that full path in the Safety script setting. This example requires `curl` and
+`jq` (`sudo apt install curl jq`). `OPEN` returns `0`, `CLOSED` returns `1`;
+curl failures, timeouts, invalid JSON, or unexpected state values return a
+different nonzero status, which the camera service treats as unsafe.
 
 ## Star counts and tests
 

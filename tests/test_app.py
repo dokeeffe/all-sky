@@ -253,6 +253,29 @@ class CameraCaptureTests(unittest.TestCase):
 
 
 class StoreAndSafetyTests(unittest.TestCase):
+    def test_s3_safety_gate_requires_current_open_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            worker = CaptureWorker(
+                store,
+                StarStore(Path(directory) / "stars.sqlite3"),
+            )
+            store.save(Settings(safety_script="/roof-check"))
+            self.assertFalse(worker.uploads_allowed())
+            with patch(
+                "allsky_app.worker.subprocess.run",
+                return_value=SimpleNamespace(returncode=1, stderr=""),
+            ):
+                self.assertFalse(worker.check_safety(store.load()))
+            self.assertFalse(worker.uploads_allowed())
+            with patch(
+                "allsky_app.worker.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stderr=""),
+            ):
+                worker._safety_checked_monotonic = 0
+                self.assertTrue(worker.check_safety(store.load()))
+            self.assertTrue(worker.uploads_allowed())
+
     def test_latest_jpeg_selects_most_recent_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -328,6 +351,41 @@ class StoreAndSafetyTests(unittest.TestCase):
 
             self.assertTrue(uploaded.is_set())
             self.assertEqual(uploader.status()["phase"], "stopped")
+
+    def test_s3_upload_waits_until_roof_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root / "settings.json")
+            store.save(Settings(
+                s3_upload=True,
+                s3_upload_interval_minutes=5,
+                s3_bucket_name="bucket",
+                s3_object_key="latest.jpg",
+                s3_access_key_id="access",
+                s3_secret="secret",
+                s3_endpoint="https://s3.example.test",
+            ))
+            preview = root / "latest-upload.jpg"
+            preview.write_bytes(b"jpg")
+            roof = {"open": False}
+            uploader = S3UploadWorker(
+                store,
+                preview,
+                uploads_allowed=lambda: roof["open"],
+            )
+
+            def wait_for_roof(_timeout: float) -> None:
+                roof["open"] = True
+
+            with (
+                patch.object(uploader.stop_event, "wait", side_effect=wait_for_roof),
+                patch("allsky_app.s3_upload.time.monotonic", return_value=100),
+                patch("allsky_app.s3_upload.upload_latest") as upload,
+            ):
+                upload.side_effect = lambda *_args: uploader.stop()
+                uploader.run()
+
+            upload.assert_called_once()
 
     def test_storage_cleanup_is_rate_limited_to_five_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

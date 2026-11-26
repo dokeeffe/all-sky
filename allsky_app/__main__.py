@@ -39,7 +39,11 @@ def main() -> None:
     settings.load().validate()
     stars = StarStore(args.state_dir / "stars.sqlite3")
     worker = CaptureWorker(settings, stars)
-    uploader = S3UploadWorker(settings, args.state_dir / "latest-upload.jpg")
+    uploader = S3UploadWorker(
+        settings,
+        args.state_dir / "latest-upload.jpg",
+        uploads_allowed=worker.uploads_allowed,
+    )
     threads = [
         threading.Thread(target=worker.run, name="capture-worker", daemon=True),
         threading.Thread(target=uploader.run, name="s3-upload-worker", daemon=True),
