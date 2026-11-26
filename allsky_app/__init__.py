@@ -1,0 +1,1 @@
+"""All-sky camera service."""
