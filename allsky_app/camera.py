@@ -135,12 +135,15 @@ def start_indi_server(port: int, driver: str) -> None:
     global _server_process, _server_log, _server_port
     if port == 7624:
         raise ValueError("Port 7624 is reserved for the observatory's main INDI server")
-    if _server_process is not None and (
-        _server_process.poll() is not None or _server_port != port
-    ):
+    if _server_process is not None:
+        if _server_process.poll() is None and _server_port == port:
+            return
         stop_indi_server()
     if _port_open(port):
-        return
+        raise RuntimeError(
+            f"INDI port {port} is already in use by another server; "
+            "configure the other INDI server to use a different port"
+        )
 
     run_dir = Path("~/.local/state/allsky-camera/indi").expanduser()
     run_dir.mkdir(parents=True, exist_ok=True)

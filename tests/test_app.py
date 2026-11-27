@@ -111,6 +111,17 @@ class StarCountTests(unittest.TestCase):
 
 
 class CameraCaptureTests(unittest.TestCase):
+    def test_refuses_to_adopt_an_unmanaged_indi_server(self) -> None:
+        with (
+            patch.object(camera, "_server_process", None),
+            patch.object(camera, "_server_port", None),
+            patch.object(camera, "_port_open", return_value=True),
+            patch.object(camera.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "port 7625 is already in use"):
+                camera.start_indi_server(7625, "indi_asi_ccd")
+        popen.assert_not_called()
+
     def test_decodes_indib_blob_with_wrapped_base64(self) -> None:
         fits_data = make_fits_image()
         encoded = base64.b64encode(fits_data).decode("ascii")

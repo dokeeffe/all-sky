@@ -13,7 +13,10 @@ approximate star count for every frame in SQLite.
 
 The private camera INDI server defaults to port **7625**. Port **7624** is
 reserved by this application for the observatory's main INDI server and is
-rejected by settings validation.
+rejected by settings validation. Keep the EKOS/observatory server and the
+all-sky camera server on different ports; for example, use 7624 for the
+observatory server and 7625 for all-sky. The same physical camera cannot be
+controlled concurrently by both servers.
 
 ## Install as a systemd user service
 

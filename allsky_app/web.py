@@ -271,7 +271,7 @@ aria-label="Star count time series for the last six hours"></svg>
 <label for="image_dir">Image directory</label><input id="image_dir" name="image_dir" required value="{html.escape(settings.image_dir, quote=True)}">
 <label for="indi_driver">INDI driver</label><input id="indi_driver" name="indi_driver" required value="{html.escape(settings.indi_driver, quote=True)}">
 <label for="device_name">Camera device name</label><input id="device_name" name="device_name" required value="{html.escape(settings.device_name, quote=True)}">
-<label for="indi_port">Private INDI server port (7624 reserved for observatory)</label><input id="indi_port" name="indi_port" type="number" min="1024" max="65535" required value="{settings.indi_port}">
+<label for="indi_port">Private INDI server port (must be unused; 7624 reserved for observatory)</label><input id="indi_port" name="indi_port" type="number" min="1024" max="65535" required value="{settings.indi_port}">
 <label for="exposure_seconds">Exposure (seconds)</label><input id="exposure_seconds" name="exposure_seconds" type="number" min="0.01" max="3600" step="0.1" required value="{settings.exposure_seconds:g}">
 <label for="delay_seconds">Delay between exposures (seconds)</label><input id="delay_seconds" name="delay_seconds" type="number" min="0" max="3600" step="0.1" required value="{settings.delay_seconds:g}">
 <label><input type="checkbox" name="auto_gain" value="yes" {checked}> Leave automatic/default gain enabled</label>
