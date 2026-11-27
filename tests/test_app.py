@@ -111,6 +111,26 @@ class StarCountTests(unittest.TestCase):
 
 
 class CameraCaptureTests(unittest.TestCase):
+    def test_starts_indi_with_a_private_local_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.dict(os.environ, {"HOME": directory}),
+                patch.object(camera, "_port_open", side_effect=[False, True]),
+                patch.object(camera.subprocess, "Popen") as popen,
+            ):
+                process = popen.return_value
+                process.poll.return_value = None
+                process.pid = 123
+                try:
+                    camera.start_indi_server(7625, "indi_asi_ccd")
+                    args = popen.call_args.args[0]
+                    self.assertEqual(
+                        args[args.index("-u") + 1],
+                        "/tmp/allsky-camera-indiserver-7625",
+                    )
+                finally:
+                    camera.stop_indi_server()
+
     def test_refuses_to_adopt_an_unmanaged_indi_server(self) -> None:
         with (
             patch.object(camera, "_server_process", None),

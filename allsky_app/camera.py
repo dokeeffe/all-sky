@@ -151,7 +151,15 @@ def start_indi_server(port: int, driver: str) -> None:
     log_handle = log_path.open("ab")
     try:
         process = subprocess.Popen(
-            ["indiserver", "-v", "-p", str(port), driver],
+            [
+                "indiserver",
+                "-v",
+                "-u",
+                f"/tmp/allsky-camera-indiserver-{port}",
+                "-p",
+                str(port),
+                driver,
+            ],
             stdout=log_handle,
             stderr=log_handle,
             stdin=subprocess.DEVNULL,
