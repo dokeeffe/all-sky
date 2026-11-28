@@ -123,10 +123,13 @@ different nonzero status, which the camera service treats as unsafe.
 
 The dashboard shows the latest recorded star count beside the live image and
 plots the count history for the most recent six hours. Both refresh with new
-captures; camera settings are tucked into a collapsed panel. Counts are
-approximate detections of isolated image peaks above a robust background-noise
-threshold, useful for following sky conditions rather than as scientific
-photometry. Tests do not require a connected camera:
+captures; camera settings are tucked into a collapsed panel. Counts use
+Photutils' DAOStarFinder with a locally estimated, sigma-clipped background and
+filters for point-source sharpness and roundness. They remain approximate (the
+detector does not perform photometric calibration) and are intended for
+following sky conditions, not scientific measurement. A compressed FITS sample
+containing stars and foreground obstructions is included in the tests. Tests do
+not require a connected camera:
 
 ```sh
 uv run python -m unittest discover -s tests -v

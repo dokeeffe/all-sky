@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "A lightweight all-sky camera capture service"
 requires-python = ">=3.11"
 dependencies = [
+    "astropy>=6",
     "boto3>=1.35",
     "numpy>=2.0",
+    "photutils>=2",
     "Pillow>=10.0",
 ]
 

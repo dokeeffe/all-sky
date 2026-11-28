@@ -12,12 +12,14 @@ import time
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from subprocess import Popen
 from typing import BinaryIO, Callable
 from xml.sax.saxutils import quoteattr
 
 import numpy as np
+from astropy.io import fits as astropy_fits
 from PIL import Image, ImageDraw
 
 from .settings import Settings
@@ -209,6 +211,15 @@ def stop_indi_server() -> None:
 atexit.register(stop_indi_server)
 
 
+def fits_to_array(data: bytes) -> np.ndarray:
+    """Decode the primary FITS image without applying a display stretch."""
+    with astropy_fits.open(BytesIO(data), memmap=False) as hdus:
+        image = hdus[0].data
+        if image is None:
+            raise ValueError("FITS primary HDU does not contain image data")
+        return np.asarray(image, dtype=np.float32)
+
+
 def fits_to_uint8(data: bytes, stretch: bool = True) -> np.ndarray:
     """Decode a simple 2-D FITS image into 8-bit pixels, oriented top-row first."""
     header: dict[str, str] = {}
@@ -384,7 +395,7 @@ def capture_frame(
             finally:
                 if temp_name is not None and os.path.exists(temp_name):
                     os.unlink(temp_name)
-        star_count = count_stars(fits_to_uint8(fits_data))
+        star_count = count_stars(fits_to_array(fits_data))
         return base_path, captured_at, star_count
     finally:
         client.close()

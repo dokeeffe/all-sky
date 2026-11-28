@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
 import struct
@@ -81,16 +82,28 @@ class SettingsTests(unittest.TestCase):
 
 
 class StarCountTests(unittest.TestCase):
-    def test_counts_isolated_peaks_above_background(self) -> None:
-        image = np.zeros((30, 30), dtype=np.uint8)
-        image[5, 5] = 100
-        image[12, 21] = 200
-        image[25, 4] = 150
+    def test_counts_point_sources_over_background_gradient(self) -> None:
+        y, x = np.indices((64, 64), dtype=np.float32)
+        image = 24 + 0.03 * x + 0.02 * y
+        image += np.random.default_rng(7).normal(0, 1.5, image.shape)
+        for x_center, y_center, amplitude in ((10, 12, 45), (31, 48, 70), (52, 21, 55)):
+            image += amplitude * np.exp(
+                -((x - x_center) ** 2 + (y - y_center) ** 2) / (2 * 1.3**2)
+            )
         self.assertEqual(count_stars(image), 3)
 
     def test_rejects_non_image_shape(self) -> None:
         with self.assertRaisesRegex(ValueError, "2-D image"):
             count_stars(np.zeros((10, 10, 3)))
+
+    def test_detects_sources_in_obstructed_fits_sample(self) -> None:
+        sample_path = Path(__file__).parent / "data" / "allsky-sample.fits.gz"
+        with gzip.open(sample_path, "rb") as sample:
+            image = camera.fits_to_array(sample.read())
+        self.assertEqual(image.shape, (960, 1280))
+        count = count_stars(image)
+        self.assertGreaterEqual(count, 45)
+        self.assertLessEqual(count, 55)
 
     def test_image_timestamp_is_drawn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -707,7 +720,8 @@ def make_fits_image() -> bytes:
         "END",
     ]
     header = "".join(card.ljust(80) for card in cards).ljust(2880).encode("ascii")
-    return header + struct.pack(">hhhhhhhhh", 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    pixels = struct.pack(">hhhhhhhhh", 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return header + pixels.ljust(2880, b"\0")
 
 
 if __name__ == "__main__":
