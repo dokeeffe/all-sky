@@ -70,6 +70,9 @@ class CaptureWorker:
                         base, captured_at, stars = capture_frame(
                             settings,
                             upload_preview_path=self.stars.path.parent / "latest-upload.jpg",
+                            annotated_image_path=(
+                                self.stars.path.parent / "latest-annotated.jpg"
+                            ),
                         )
                         image_record = (
                             base.with_suffix(".fits")

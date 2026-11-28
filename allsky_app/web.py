@@ -61,6 +61,10 @@ class Dashboard:
                 latest_mtime = mtime
         return latest
 
+    @property
+    def latest_annotated_image(self) -> Path:
+        return self.stars.path.parent / "latest-annotated.jpg"
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "AllSkyCamera/0.1"
@@ -98,6 +102,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(content)
+        elif path == "/latest-annotated.jpg":
+            image = self.dashboard.latest_annotated_image
+            try:
+                content = image.read_bytes()
+            except FileNotFoundError:
+                self.send_error(404, "No annotated image is available")
+                return
+            except OSError:
+                logger.exception("Could not read annotated image %s", image)
+                self.send_error(500, "Could not read annotated image")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
         elif path == "/api/status":
             latest = self.dashboard.latest_image()
             try:
@@ -105,6 +126,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except OSError:
                 latest = None
                 latest_version = None
+            try:
+                annotated_version = (
+                    self.dashboard.latest_annotated_image.stat().st_mtime_ns
+                )
+            except FileNotFoundError:
+                annotated_version = None
+            except OSError:
+                logger.exception(
+                    "Could not stat annotated image %s",
+                    self.dashboard.latest_annotated_image,
+                )
+                annotated_version = None
             self._send_json({
                 "worker": self.dashboard.worker.status(),
                 "s3_upload": (
@@ -117,6 +150,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "latest_image": latest.name if latest else None,
                 "latest_image_path": str(latest) if latest else None,
                 "latest_version": latest_version,
+                "latest_annotated_version": annotated_version,
             })
         else:
             self.send_error(404)
@@ -237,6 +271,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <style>
 body{{font:16px system-ui,sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;color:#17212b;background:#f4f7fa}}
 h1,h2{{margin-bottom:.5rem}} section{{background:white;padding:1.2rem;margin:1rem 0;border-radius:8px;box-shadow:0 1px 5px #ccd3da}}
+.section-heading{{display:flex;align-items:center;justify-content:space-between;gap:1rem}}
+.section-heading button{{margin:0;flex-shrink:0}}
 label{{display:block;margin:.75rem 0 .25rem}} input{{box-sizing:border-box;max-width:100%;padding:.45rem;width:30rem}}
 input[type=checkbox]{{width:auto}}button{{margin-top:1rem;padding:.65rem 1rem;background:#174f78;color:white;border:0;border-radius:4px}}
 .latest{{width:100%;height:auto}}.error{{color:#a00}}.empty{{padding:3rem;text-align:center;background:#111;color:#ddd}}
@@ -253,7 +289,8 @@ summary{{cursor:pointer;font-size:1.2rem;font-weight:600}}details form{{padding-
 <p class="muted">Capture service: <strong>{status_text}</strong> · Roof safety: <strong>{html.escape(safety_text)}</strong></p>
 <p class="muted">S3 upload: <strong id="s3-upload-status">{upload_text}</strong> · Last upload: <span id="s3-upload-time">{html.escape(str(upload_time))}</span> <span id="s3-upload-error" class="error">{html.escape(str(upload_error or ""))}</span></p>
 {error_html}
-<section><h2>Live sky</h2><div class="live-grid">
+<section><div class="section-heading"><h2>Live sky</h2>
+<button id="annotated-toggle" type="button" aria-pressed="false">Show detected sources</button></div><div class="live-grid">
 <div><div id="image-container">{image_html}</div>
 <p id="latest-path" class="muted">{html.escape(str(latest) if latest else '')}</p></div>
 <div class="star-card"><h3>Latest star count</h3>
@@ -265,7 +302,7 @@ summary{{cursor:pointer;font-size:1.2rem;font-weight:600}}details form{{padding-
 <svg id="star-chart" class="chart" viewBox="0 0 800 280" role="img"
 aria-label="Star count time series for the last six hours"></svg>
 <p id="chart-empty" class="muted">Waiting for star-count measurements.</p>
-<p class="muted">Approximate local-maximum detections; useful for following sky conditions.</p></section>
+<p class="muted">Approximate point-source detections; useful for following sky conditions.</p></section>
 <details><summary>Camera settings</summary>
 <form method="post" action="/settings">
 <label for="image_dir">Image directory</label><input id="image_dir" name="image_dir" required value="{html.escape(settings.image_dir, quote=True)}">
@@ -315,11 +352,41 @@ aria-label="Star count time series for the last six hours"></svg>
 
   const container = document.getElementById("image-container");
   const pathLabel = document.getElementById("latest-path");
+  const annotatedToggle = document.getElementById("annotated-toggle");
   const countLabel = document.getElementById("latest-star-count");
   const timeLabel = document.getElementById("latest-star-time");
   const chart = document.getElementById("star-chart");
   const chartEmpty = document.getElementById("chart-empty");
   const svgNamespace = "http://www.w3.org/2000/svg";
+  let showAnnotated = false;
+  let latestImageVersion = null;
+  let latestAnnotatedVersion = null;
+
+  function updateImage() {{
+    const image = container.querySelector("img");
+    const version = showAnnotated ? latestAnnotatedVersion : latestImageVersion;
+    if (!image || version === null) return;
+    const source = showAnnotated
+      ? `/latest-annotated.jpg?v=${{encodeURIComponent(version)}}`
+      : `/latest.jpg?v=${{encodeURIComponent(version)}}`;
+    const key = `${{showAnnotated ? "annotated" : "live"}}:${{version}}`;
+    if (image.dataset.version !== key) {{
+      image.dataset.version = key;
+      image.src = source;
+      image.alt = showAnnotated
+        ? "Latest all-sky image with detected sources annotated"
+        : "Latest all-sky image";
+    }}
+  }}
+
+  annotatedToggle.addEventListener("click", () => {{
+    showAnnotated = !showAnnotated;
+    annotatedToggle.setAttribute("aria-pressed", showAnnotated.toString());
+    annotatedToggle.textContent = showAnnotated
+      ? "Show live sky"
+      : "Show detected sources";
+    updateImage();
+  }});
 
   function drawChart(points) {{
     chart.replaceChildren();
@@ -373,6 +440,8 @@ aria-label="Star count time series for the last six hours"></svg>
       const response = await fetch("/api/status", {{cache: "no-store"}});
       if (!response.ok) throw new Error(`Status request failed: ${{response.status}}`);
       const status = await response.json();
+      latestImageVersion = status.latest_version;
+      latestAnnotatedVersion = status.latest_annotated_version;
       const uploadStatus = status.s3_upload;
       document.getElementById("s3-upload-status").textContent = uploadStatus.phase;
       document.getElementById("s3-upload-time").textContent =
@@ -381,7 +450,6 @@ aria-label="Star count time series for the last six hours"></svg>
       uploadError.textContent = uploadStatus.last_error || "";
       uploadError.hidden = !uploadStatus.last_error;
       if (status.latest_image && status.latest_version !== null) {{
-        const version = `${{status.latest_image}}:${{status.latest_version}}`;
         let image = container.querySelector("img");
         if (!image) {{
           container.replaceChildren();
@@ -390,11 +458,8 @@ aria-label="Star count time series for the last six hours"></svg>
           image.alt = "Latest all-sky image";
           container.append(image);
         }}
-        if (image.dataset.version !== version) {{
-          image.dataset.version = version;
-          image.src = `/latest.jpg?v=${{encodeURIComponent(version)}}`;
-          pathLabel.textContent = status.latest_image_path;
-        }}
+        pathLabel.textContent = status.latest_image_path;
+        updateImage();
       }}
       if (status.latest_star) {{
         countLabel.textContent = status.latest_star.star_count.toLocaleString();

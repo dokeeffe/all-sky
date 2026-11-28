@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import io
 import json
 import os
 import struct
@@ -25,7 +26,7 @@ from allsky_app.image_maintenance import prune_image_directory
 from allsky_app.s3_upload import S3UploadWorker, latest_jpeg, upload_latest
 from allsky_app.settings import Settings, SettingsStore
 from allsky_app.star_store import StarStore
-from allsky_app.stars import count_stars
+from allsky_app.stars import count_stars, find_sources
 from allsky_app.web import Dashboard, DashboardHandler
 from allsky_app.worker import CaptureWorker
 
@@ -99,11 +100,24 @@ class StarCountTests(unittest.TestCase):
     def test_detects_sources_in_obstructed_fits_sample(self) -> None:
         sample_path = Path(__file__).parent / "data" / "allsky-sample.fits.gz"
         with gzip.open(sample_path, "rb") as sample:
-            image = camera.fits_to_array(sample.read())
+            fits_data = sample.read()
+        image = camera.fits_to_array(fits_data)
         self.assertEqual(image.shape, (960, 1280))
-        count = count_stars(image)
+        sources = find_sources(image)
+        count = len(sources)
         self.assertGreaterEqual(count, 45)
         self.assertLessEqual(count, 55)
+        with tempfile.TemporaryDirectory() as directory:
+            annotated_path = Path(directory) / "latest-annotated.jpg"
+            camera.save_annotated_preview(fits_data, sources, annotated_path)
+            with Image.open(annotated_path) as annotated:
+                pixels = np.asarray(annotated)
+        red_markers = (
+            (pixels[:, :, 0] > 150)
+            & (pixels[:, :, 1] < 100)
+            & (pixels[:, :, 2] < 100)
+        )
+        self.assertGreater(np.count_nonzero(red_markers), 20)
 
     def test_image_timestamp_is_drawn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -228,10 +242,17 @@ class CameraCaptureTests(unittest.TestCase):
                     save_fits=False,
                     save_jpg=False,
                 )
-                base_path, captured_at, star_count = camera.capture_frame(settings)
+                annotated_path = Path(directory) / "state" / "latest-annotated.jpg"
+                base_path, captured_at, star_count = camera.capture_frame(
+                    settings,
+                    annotated_image_path=annotated_path,
+                )
 
             start_server.assert_called_once_with(7625, "indi_asi_ccd")
             stamp.assert_not_called()
+            self.assertTrue(annotated_path.is_file())
+            with Image.open(annotated_path) as annotated:
+                self.assertEqual(annotated.size, (3, 3))
             self.assertEqual(base_path.parent, Path(directory))
             self.assertRegex(base_path.name, r"^allsky-\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d$")
             self.assertFalse(base_path.with_suffix(".fits").exists())
@@ -552,6 +573,8 @@ class WebTests(unittest.TestCase):
         page = urlopen(self.base_url).read().decode()
         self.assertIn("All-sky camera", page)
         self.assertIn("Latest star count", page)
+        self.assertIn('id="annotated-toggle"', page)
+        self.assertIn("Show detected sources", page)
         self.assertIn("Camera settings", page)
         self.assertIn("<details>", page)
         self.assertIn('id="star-chart"', page)
@@ -568,10 +591,18 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.read(), b"jpeg data")
         response = urlopen(f"{self.base_url}/latest.jpg?v=unique")
         self.assertEqual(response.read(), b"jpeg data")
+        annotated = self.stars.path.parent / "latest-annotated.jpg"
+        Image.new("RGB", (10, 10), "black").save(annotated)
+        response = urlopen(f"{self.base_url}/latest-annotated.jpg")
+        self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+        with Image.open(io.BytesIO(response.read())) as preview:
+            self.assertEqual(preview.size, (10, 10))
 
     def test_status_api_reports_latest_image_version(self) -> None:
         image = self.image_dir / "allsky-2026-11-26-21-39-02.jpg"
         image.write_bytes(b"jpeg data")
+        annotated = self.stars.path.parent / "latest-annotated.jpg"
+        annotated.write_bytes(b"annotated image")
         self.stars.add(
             image.with_suffix(".fits"),
             42,
@@ -582,6 +613,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status["latest_image"], image.name)
         self.assertEqual(status["latest_image_path"], str(image))
         self.assertIsInstance(status["latest_version"], int)
+        self.assertIsInstance(status["latest_annotated_version"], int)
         self.assertEqual(status["latest_star"]["star_count"], 42)
         self.assertEqual(status["star_series"][-1]["star_count"], 42)
 
@@ -589,6 +621,7 @@ class WebTests(unittest.TestCase):
         page = urlopen(self.base_url).read().decode()
         self.assertIn("window.setInterval(checkForNewImage, 3000)", page)
         self.assertIn("drawChart(status.star_series)", page)
+        self.assertIn("/latest-annotated.jpg?v=", page)
 
     def test_saves_valid_settings(self) -> None:
         data = (

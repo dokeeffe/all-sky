@@ -23,7 +23,7 @@ from astropy.io import fits as astropy_fits
 from PIL import Image, ImageDraw
 
 from .settings import Settings
-from .stars import count_stars
+from .stars import find_sources
 
 logger = logging.getLogger(__name__)
 _server_process: Popen[bytes] | None = None
@@ -311,6 +311,7 @@ def decode_blob(encoded_blob: str, blob_format: str) -> bytes:
 def capture_frame(
     settings: Settings,
     upload_preview_path: Path | None = None,
+    annotated_image_path: Path | None = None,
 ) -> tuple[Path, datetime, int]:
     settings.validate()
     start_indi_server(settings.indi_port, settings.indi_driver)
@@ -395,7 +396,10 @@ def capture_frame(
             finally:
                 if temp_name is not None and os.path.exists(temp_name):
                     os.unlink(temp_name)
-        star_count = count_stars(fits_to_array(fits_data))
+        sources = find_sources(fits_to_array(fits_data))
+        if annotated_image_path is not None:
+            save_annotated_preview(fits_data, sources, annotated_image_path)
+        star_count = len(sources)
         return base_path, captured_at, star_count
     finally:
         client.close()
@@ -418,3 +422,47 @@ def stamp_image(image_path: Path, stamp: str) -> None:
     )
     draw.text((8, 6), stamp, fill=(255, 255, 255))
     image.save(image_path, format="JPEG", quality=92)
+
+
+def save_annotated_preview(
+    fits_data: bytes,
+    sources: list[tuple[float, float]],
+    image_path: Path,
+) -> None:
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.fromarray(fits_to_uint8(fits_data, stretch=True)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    height = image.height
+    for x, y in sources:
+        display_y = height - 1 - y
+        radius = 7
+        draw.ellipse(
+            (x - radius, display_y - radius, x + radius, display_y + radius),
+            outline=(255, 48, 48),
+            width=2,
+        )
+        draw.line(
+            (x - radius - 2, display_y, x + radius + 2, display_y),
+            fill=(255, 48, 48),
+            width=1,
+        )
+        draw.line(
+            (x, display_y - radius - 2, x, display_y + radius + 2),
+            fill=(255, 48, 48),
+            width=1,
+        )
+
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=image_path.parent,
+            prefix=f".{image_path.stem}-",
+            suffix=".jpg",
+            delete=False,
+        ) as temp_file:
+            temp_name = temp_file.name
+        image.save(temp_name, format="JPEG", quality=92)
+        os.replace(temp_name, image_path)
+    finally:
+        if temp_name is not None and os.path.exists(temp_name):
+            os.unlink(temp_name)
