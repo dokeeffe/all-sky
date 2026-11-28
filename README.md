@@ -126,7 +126,9 @@ plots the count history for the most recent six hours. Both refresh with new
 captures; a toggle beside “Live sky” switches to the latest source-annotated
 preview. Only that latest annotation is kept in the application state directory;
 timestamped camera images are unchanged. Camera settings are tucked into a
-collapsed panel. Counts use
+collapsed panel. For the chart, counts more than three standard deviations from
+the preceding up to ten accepted measurements are omitted; all raw counts
+remain stored and the latest count display is unchanged. Counts use
 Photutils' DAOStarFinder with a locally estimated, sigma-clipped background and
 filters for point-source sharpness and roundness. They remain approximate (the
 detector does not perform photometric calibration) and are intended for

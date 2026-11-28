@@ -13,7 +13,7 @@ from PIL import Image
 from .camera import fits_to_uint8
 from .s3_upload import S3UploadWorker
 from .settings import Settings, SettingsStore
-from .star_store import StarStore
+from .star_store import StarStore, filter_star_count_outliers
 from .worker import CaptureWorker
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     else {"phase": "disabled", "last_uploaded_at": None, "last_error": None}
                 ),
                 "latest_star": self.dashboard.stars.latest(),
-                "star_series": self.dashboard.stars.since(6),
+                "star_series": filter_star_count_outliers(
+                    self.dashboard.stars.since(6)
+                ),
                 "latest_image": latest.name if latest else None,
                 "latest_image_path": str(latest) if latest else None,
                 "latest_version": latest_version,

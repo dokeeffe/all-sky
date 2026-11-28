@@ -25,7 +25,7 @@ from allsky_app.camera import stamp_image
 from allsky_app.image_maintenance import prune_image_directory
 from allsky_app.s3_upload import S3UploadWorker, latest_jpeg, upload_latest
 from allsky_app.settings import Settings, SettingsStore
-from allsky_app.star_store import StarStore
+from allsky_app.star_store import StarStore, filter_star_count_outliers
 from allsky_app.stars import count_stars, find_sources
 from allsky_app.web import Dashboard, DashboardHandler
 from allsky_app.worker import CaptureWorker
@@ -521,6 +521,29 @@ class StoreAndSafetyTests(unittest.TestCase):
             series = store.since(6)
             self.assertEqual([row["star_count"] for row in series], [12, 18])
 
+    def test_outlier_filter_omits_spikes_without_poisoning_following_baseline(self) -> None:
+        counts = [80, 82, 78, 81, 79, 80, 83, 77, 82, 79, 8_000, 81]
+        series = [
+            {"captured_at": str(index), "star_count": count}
+            for index, count in enumerate(counts)
+        ]
+
+        filtered = filter_star_count_outliers(series)
+
+        self.assertEqual(
+            [point["star_count"] for point in filtered],
+            [80, 82, 78, 81, 79, 80, 83, 77, 82, 79, 81],
+        )
+        self.assertEqual(series[10]["star_count"], 8_000)
+
+    def test_outlier_filter_allows_small_changes_in_a_stable_series(self) -> None:
+        series = [
+            {"captured_at": str(index), "star_count": count}
+            for index, count in enumerate([80] * 5 + [81])
+        ]
+
+        self.assertEqual(filter_star_count_outliers(series), series)
+
     def test_closed_safety_result_is_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             worker = CaptureWorker(
@@ -616,6 +639,26 @@ class WebTests(unittest.TestCase):
         self.assertIsInstance(status["latest_annotated_version"], int)
         self.assertEqual(status["latest_star"]["star_count"], 42)
         self.assertEqual(status["star_series"][-1]["star_count"], 42)
+        self.assertEqual(
+            len(status["star_series"]),
+            len(self.stars.since(6)),
+        )
+
+    def test_status_api_omits_outliers_from_plot_series_only(self) -> None:
+        now = datetime.now(timezone.utc)
+        counts = [80, 82, 78, 81, 79, 80, 83, 77, 82, 79, 8_000]
+        for index, count in enumerate(counts):
+            self.stars.add(
+                self.image_dir / f"frame-{index}.fits",
+                count,
+                now - timedelta(minutes=len(counts) - index),
+            )
+
+        status = json.loads(urlopen(f"{self.base_url}/api/status").read())
+
+        self.assertEqual(len(status["star_series"]), len(counts) - 1)
+        self.assertEqual(status["latest_star"]["star_count"], 8_000)
+        self.assertEqual(self.stars.latest()["star_count"], 8_000)
 
     def test_dashboard_has_auto_refresh_polling(self) -> None:
         page = urlopen(self.base_url).read().decode()

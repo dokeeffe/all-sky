@@ -1,8 +1,31 @@
 from __future__ import annotations
 
 import sqlite3
+import statistics
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+def filter_star_count_outliers(
+    series: list[dict[str, str | int]],
+    window_size: int = 10,
+    minimum_history: int = 5,
+    sigma_limit: float = 3.0,
+) -> list[dict[str, str | int]]:
+    """Omit counts beyond three standard deviations of recent accepted frames."""
+    history: deque[int] = deque(maxlen=window_size)
+    filtered: list[dict[str, str | int]] = []
+    for point in series:
+        count = int(point["star_count"])
+        if len(history) >= minimum_history:
+            mean = statistics.fmean(history)
+            deviation = max(statistics.pstdev(history), 1.0)
+            if abs(count - mean) > sigma_limit * deviation:
+                continue
+        filtered.append(point)
+        history.append(count)
+    return filtered
 
 
 class StarStore:
